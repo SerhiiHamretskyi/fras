@@ -16,6 +16,9 @@ class FrasPipeline:
                                     (main loop) -> Voice
     Every arrow is a small bounded queue, so slow stages drop old frames
     instead of building up lag.
+
+    The reference store is kept on the object (self.store) so main.py can
+    enroll new faces while the pipeline is running.
     """
 
     def __init__(self):
@@ -27,7 +30,7 @@ class FrasPipeline:
         self.voice_queue = queue.Queue(maxsize=10)
         self.preview_queue = queue.Queue(maxsize=2) if config.SHOW_WINDOW else None
 
-        store = ReferenceStore(config.REFERENCE_DIR)
+        self.store = ReferenceStore(config.REFERENCE_DIR)
 
         self.threads = [
             CaptureThread(self.frame_queue, self.stop_event,
@@ -36,7 +39,7 @@ class FrasPipeline:
                            config.DETECTOR_PROTOTXT, config.DETECTOR_MODEL,
                            config.DETECTOR_CONFIDENCE),
             RecognizerThread(self.face_queue, self.result_queue, self.stop_event,
-                             store, config.RECOGNITION_THRESHOLD),
+                             self.store, config.RECOGNITION_THRESHOLD),
             VoiceThread(self.voice_queue, self.stop_event, config.VOICE_COOLDOWN),
         ]
 

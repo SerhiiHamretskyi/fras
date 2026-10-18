@@ -1,19 +1,39 @@
 import os
+import cv2 as cv
 import face_recognition
 
 
 class ReferenceStore:
     """
-    Loads reference photos from a folder structure (one subfolder per
-    person), computes a face encoding for each photo, and keeps them
-    in memory for comparison against live face crops.
+    Holds encodings of known faces. Loads them from reference_faces/
+    at startup and can enroll new faces while the program is running.
     """
 
     def __init__(self, reference_dir: str):
         self.reference_dir = reference_dir
-        self.known_encodings = []   # list of 128-d vectors
-        self.known_names = []       # parallel list of names
+        self.known_encodings = []
+        self.known_names = []
         self._load()
+
+    @staticmethod
+    def _encode(image_rgb):
+        """Return the encoding of the first face found, or None."""
+        locations = face_recognition.face_locations(
+            image_rgb, number_of_times_to_upsample=2
+        )
+        if not locations:
+            return None
+        encodings = face_recognition.face_encodings(
+            image_rgb, known_face_locations=locations
+        )
+        return encodings[0] if encodings else None
+
+    def _add(self, name, encoding):
+        # Names first, then encodings: the recognizer thread reads these
+        # lists without a lock, so any index valid for encodings must
+        # also be valid for names.
+        self.known_names.append(name)
+        self.known_encodings.append(encoding)
 
     def _load(self):
         if not os.path.isdir(self.reference_dir):
@@ -28,27 +48,31 @@ class ReferenceStore:
             for filename in os.listdir(person_dir):
                 filepath = os.path.join(person_dir, filename)
                 image = face_recognition.load_image_file(filepath)
+                encoding = self._encode(image)
 
-                # Upsampling helps catch faces that are smaller/farther
-                # from camera in reference photos — default (0) can miss them.
-                face_locations = face_recognition.face_locations(
-                    image, number_of_times_to_upsample=2
-                )
-
-                if len(face_locations) == 0:
+                if encoding is None:
                     print(f"Warning: no face found in {filepath}, skipping")
                     continue
-
-                encodings = face_recognition.face_encodings(
-                    image, known_face_locations=face_locations
-                )
-
-                if len(encodings) == 0:
-                    print(f"Warning: could not encode face in {filepath}, skipping")
-                    continue
-
-                self.known_encodings.append(encodings[0])
-                self.known_names.append(person_name)
+                self._add(person_name, encoding)
 
         print(f"Loaded {len(self.known_encodings)} reference encodings "
               f"for {len(set(self.known_names))} people")
+
+    def enroll(self, frame_bgr, name: str):
+        """
+        Save a snapshot under reference_faces/<name>/ and add the face
+        to memory right away. Returns the saved path, or None if no
+        face was found (nothing is saved in that case).
+        """
+        encoding = self._encode(cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB))
+        if encoding is None:
+            return None
+
+        person_dir = os.path.join(self.reference_dir, name)
+        os.makedirs(person_dir, exist_ok=True)
+        index = len([f for f in os.listdir(person_dir) if f.startswith("photo")]) + 1
+        path = os.path.join(person_dir, f"photo{index}.jpg")
+        cv.imwrite(path, frame_bgr)
+
+        self._add(name, encoding)
+        return path

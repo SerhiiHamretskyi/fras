@@ -1,14 +1,19 @@
-# core/recognizer.py
-
 import threading
 import queue
-import numpy as np
+import cv2 as cv
 import face_recognition
 
 
 class RecognizerThread(threading.Thread):
-    def __init__(self, face_queue, result_queue, stop_event, reference_store,
-                 distance_threshold=0.6):
+    """
+    Takes face crops from face_queue, computes an encoding, and compares
+    it against the known encodings in the reference store. Pushes
+    (frame, bbox, name, distance) to result_queue.
+    """
+
+    def __init__(self, face_queue: queue.Queue, result_queue: queue.Queue,
+                 stop_event: threading.Event, reference_store,
+                 distance_threshold: float = 0.6):
         super().__init__(daemon=True)
         self.face_queue = face_queue
         self.result_queue = result_queue
@@ -23,10 +28,14 @@ class RecognizerThread(threading.Thread):
             except queue.Empty:
                 continue
 
-            face_crop = np.ascontiguousarray(face_crop)  # <-- the fix
+            # OpenCV frames are BGR, face_recognition expects RGB. The
+            # conversion also returns a fresh contiguous array, which dlib
+            # needs (that was the earlier "incompatible function arguments"
+            # crash).
+            face_crop = cv.cvtColor(face_crop, cv.COLOR_BGR2RGB)
 
             h, w = face_crop.shape[:2]
-            known_location = [(0, w, h, 0)]
+            known_location = [(0, w, h, 0)]  # (top, right, bottom, left)
 
             encodings = face_recognition.face_encodings(
                 face_crop, known_face_locations=known_location
@@ -44,8 +53,11 @@ class RecognizerThread(threading.Thread):
                 )
                 best_index = distances.argmin()
                 best_distance = distances[best_index]
-                name = (self.reference_store.known_names[best_index]
-                        if best_distance <= self.distance_threshold else "Unknown")
+
+                if best_distance <= self.distance_threshold:
+                    name = self.reference_store.known_names[best_index]
+                else:
+                    name = "Unknown"
                 distance = best_distance
 
             if self.result_queue.full():
