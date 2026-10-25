@@ -220,3 +220,6 @@ __marimo__/
 # FRAS
 .idea/
 reference_faces/
+
+.pytest_cache/
+spoof_debug.jpg

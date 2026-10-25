@@ -1,16 +1,23 @@
 import queue
+import random
 import time
 import cv2 as cv
 
 import config
-from core.liveness import BlinkCounter, mean_ear
+from core.liveness import BlinkCounter, HeadMoveChecker, ear_from, landmarks, pose_from
 from core.pipeline import FrasPipeline
+from core.spoof import SpoofDetector
 
 ENTER, ESC = 13, 27
 BACKSPACE = (8, 127)
 FONT = cv.FONT_HERSHEY_SIMPLEX
 GREEN, YELLOW, RED = (0, 255, 0), (0, 200, 255), (0, 0, 255)  # BGR
 TIMES = {1: "once", 2: "twice", 3: "three times"}
+# what is said for each head movement ("your" = the person, not the screen)
+MOVES = {"left": "Please turn your head to your left", "right": "Please turn your head to your right",
+         "up": "Please look up", "down": "Please look down"}
+def cfg(name, default):
+    return getattr(config, name, default)  # new settings work even before they are added to config.py
 
 
 def name_char(key):
@@ -30,6 +37,13 @@ def main():
     counter = BlinkCounter(config.BLINK_CLOSE_THRESHOLD, config.BLINK_OPEN_THRESHOLD,
                            config.BLINK_MIN_CLOSED_FRAMES, config.BLINK_MAX_CLOSED_SECONDS)
 
+    head = HeadMoveChecker(cfg("HEAD_YAW_DELTA", 0.12), cfg("HEAD_PITCH_DELTA", 0.08),
+                           cfg("HEAD_HOLD_RESULTS", 2))
+    stage, stage_start = "blink", 0.0          # a challenge = blinks first, then random head moves
+    commands, cmd_idx, move_done = [], 0, False
+    spoof = SpoofDetector(config.SPOOF_MODEL) if config.SPOOF_ENABLED else None
+    spoof_scores = []                            # 'real' scores collected during one challenge
+
     last_bbox, last_name, last_frame, last_seen = None, None, None, 0.0
     typing, buffer, pending_frame = False, "", None
     message, message_until = "", 0.0
@@ -45,10 +59,27 @@ def main():
         except queue.Full:
             pass
 
+    def begin_move(now):
+        nonlocal stage_start
+        stage_start = now
+        head.start_move()
+        say(MOVES[commands[cmd_idx]])
+
+    def fail(now):
+        nonlocal challenge_name, next_auto, message, message_until
+        challenge_name = None
+        next_auto = now + config.BLINK_RETRY_SECONDS
+        say("Liveness check failed")
+        message, message_until = "Liveness check failed", now + 3
+
     def start_challenge(name):
-        nonlocal challenge_name, challenge_start
+        nonlocal challenge_name, challenge_start, stage, stage_start, commands, cmd_idx, move_done
         challenge_name, challenge_start = name, time.time()
+        stage, stage_start, cmd_idx, move_done = "blink", challenge_start, 0, False
+        commands = random.sample(list(MOVES), min(cfg("HEAD_MOVES", 1), len(MOVES)))
         counter.reset()
+        head.reset()
+        spoof_scores.clear()
         n = config.BLINK_TARGET
         say(f"Please blink {TIMES.get(n, str(n) + ' times')}")
 
@@ -68,11 +99,24 @@ def main():
                 if typing:
                     pass  # stay quiet while a name is being typed
                 elif challenge_name is not None:
-                    # Blink challenge running: count blinks of the person being checked only
-                    if name == challenge_name and now - challenge_start >= config.BLINK_PROMPT_DELAY:
-                        ear = mean_ear(res_frame, bbox)
-                        if ear is not None:
-                            counter.update(ear, now)
+                    # Challenge running: only the person being checked counts. While the head
+                    # moves the face may briefly look "Unknown", so that is accepted there.
+                    same_person = name == challenge_name or (stage == "head" and name == "Unknown")
+                    if same_person and now - challenge_start >= config.BLINK_PROMPT_DELAY:
+                        lm = landmarks(res_frame, bbox)
+                        pose = pose_from(lm) if lm is not None else None
+                        if stage == "blink":
+                            if lm is not None:
+                                counter.update(ear_from(lm), now)
+                            if pose is not None:
+                                head.add_baseline(*pose)  # neutral pose to measure the move against
+                            if spoof is not None:  # scored on the frontal face only
+                                score = spoof.real_score(res_frame, bbox)
+                                if score is not None:
+                                    spoof_scores.append(score)
+                        elif (pose is not None and now - stage_start >= cfg("HEAD_PROMPT_DELAY", 1.0)
+                              and head.moved(commands[cmd_idx], *pose)):
+                            move_done = True
                 elif name == "Unknown" or name == live_name:
                     # Unknown faces are announced; known faces only after the blink check
                     try:
@@ -90,15 +134,40 @@ def main():
             if gone > getattr(config, "LIVE_TTL", 15.0):
                 live_name = None
 
-            # 3. Challenge finished?
+            # 3. Challenge progress: blinks -> head moves -> spoof check
             if challenge_name is not None:
-                if counter.blinks >= config.BLINK_TARGET:
-                    live_name, challenge_name = challenge_name, None  # greeting follows
-                elif now - challenge_start > config.BLINK_TIMEOUT:
-                    challenge_name = None
-                    next_auto = now + config.BLINK_RETRY_SECONDS
-                    say("Liveness check failed")
-                    message, message_until = "Liveness check failed", now + 3
+                finished = False
+                if stage == "blink":
+                    if counter.blinks >= config.BLINK_TARGET:
+                        if commands:
+                            stage = "head"
+                            begin_move(now)
+                        else:
+                            finished = True
+                    elif now - stage_start > config.BLINK_TIMEOUT:
+                        fail(now)
+                else:
+                    if move_done:
+                        move_done = False
+                        cmd_idx += 1
+                        if cmd_idx >= len(commands):
+                            finished = True
+                        else:
+                            begin_move(now)
+                    elif now - stage_start > cfg("HEAD_TIMEOUT", 6.0):
+                        fail(now)
+
+                if finished:
+                    passed = True
+                    if spoof is not None:
+                        avg = sum(spoof_scores) / len(spoof_scores) if spoof_scores else 0.0
+                        print(f"spoof score {avg:.2f} over {len(spoof_scores)} frames "
+                              f"(needs {config.SPOOF_THRESHOLD})")
+                        passed = avg >= config.SPOOF_THRESHOLD
+                    if passed:
+                        live_name, challenge_name = challenge_name, None  # greeting follows
+                    else:
+                        fail(now)
 
             if not config.SHOW_WINDOW:
                 continue
@@ -130,11 +199,14 @@ def main():
                                        (x1, y2 + 25), FONT, 0.6, YELLOW, 2)
 
                 if challenge_name is not None:
-                    left = config.BLINK_TIMEOUT - (now - challenge_start)
-                    cv.putText(frame,
-                               f"Blink {config.BLINK_TARGET} times: "
-                               f"{counter.blinks}/{config.BLINK_TARGET}  ({max(left, 0):.0f}s)",
-                               (10, 60), FONT, 0.7, YELLOW, 2)
+                    if stage == "blink":
+                        left = config.BLINK_TIMEOUT - (now - stage_start)
+                        text = (f"Blink {config.BLINK_TARGET} times: "
+                                f"{counter.blinks}/{config.BLINK_TARGET}  ({max(left, 0):.0f}s)")
+                    else:
+                        left = cfg("HEAD_TIMEOUT", 6.0) - (now - stage_start)
+                        text = f"Move head: {commands[cmd_idx].upper()}  ({max(left, 0):.0f}s)"
+                    cv.putText(frame, text, (10, 60), FONT, 0.7, YELLOW, 2)
                 if typing:
                     cv.putText(frame, f"Name: {buffer}_   (Enter = save, Esc = cancel)",
                                (10, h - 20), FONT, 0.6, (255, 255, 255), 2)
